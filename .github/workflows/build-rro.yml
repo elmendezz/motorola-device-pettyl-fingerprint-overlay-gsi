@@ -1,0 +1,120 @@
+# Version: 1
+# Changelog:
+# - Initial creation of RRO build workflow with dynamic versioning based on git tags
+# - Added automated version calculation logic (starts at 1.0.0, increments patch up to 9, then minor up to 9, then major)
+# - Integrated AAPT2 compilation and alignment pipeline using SDK build-tools
+# - Added AndroidManifest.xml dynamic attributes injection for versionName and versionCode
+# - Added GitHub Release creation and APK asset upload step
+
+name: Build and Release RRO Overlay
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Calculate Next Version
+        id: versioning
+        run: |
+          # Obtener el último tag que cumpla con el formato vX.Y.Z
+          LATEST_TAG=$(git describe --tags --abbrev=0 --match "v*.*.*" 2>/dev/null || echo "")
+
+          if [ -z "$LATEST_TAG" ]; then
+            NEW_VERSION="1.0.0"
+          else
+            # Remover la 'v' inicial
+            RAW_VER="${LATEST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$RAW_VER"
+
+            # Lógica de incremento (hasta 9)
+            if [ "$PATCH" -lt 9 ]; then
+              PATCH=$((PATCH + 1))
+            else
+              PATCH=0
+              if [ "$MINOR" -lt 9 ]; then
+                MINOR=$((MINOR + 1))
+              else
+                MINOR=0
+                MAJOR=$((MAJOR + 1))
+              fi
+            fi
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          # Calcular versionCode secuencial (ejemplo: 1.0.0 -> 10000, 1.0.9 -> 10009)
+          IFS='.' read -r MA MI PA <<< "$NEW_VERSION"
+          VERSION_CODE=$((MA * 10000 + MI * 100 + PA))
+
+          echo "VERSION_NAME=${NEW_VERSION}" >> $GITHUB_ENV
+          echo "VERSION_CODE=${VERSION_CODE}" >> $GITHUB_ENV
+          echo "TAG_NAME=v${NEW_VERSION}" >> $GITHUB_ENV
+
+          echo "Nueva versión calculada: ${NEW_VERSION} (code: ${VERSION_CODE})"
+
+      - name: Inject Version into AndroidManifest.xml
+        run: |
+          # Insertar android:versionCode y android:versionName dentro del tag <manifest>
+          sed -i "s/<manifest /<manifest android:versionCode=\"${VERSION_CODE}\" android:versionName=\"${VERSION_NAME}\" /g" AndroidManifest.xml
+
+      - name: Setup Android SDK Tools
+        uses: android-actions/setup-android@v3
+
+      - name: Build Overlay APK
+        run: |
+          # Ubicar herramientas del Android SDK
+          ANDROID_BUILD_TOOLS="${ANDROID_HOME}/build-tools/34.0.0"
+          PLATFORM_JAR="${ANDROID_HOME}/platforms/android-34/android.jar"
+
+          # Fallback a android.jar del repositorio si no existe en el runner
+          if [ ! -f "$PLATFORM_JAR" ]; then
+            PLATFORM_JAR="./android.jar"
+          fi
+
+          mkdir -p build
+
+          # 1. Compilar recursos con AAPT2
+          ${ANDROID_BUILD_TOOLS}/aapt2 compile --dir res/ -o build/resources.zip
+
+          # 2. Vincular y generar APK no alineado
+          ${ANDROID_BUILD_TOOLS}/aapt2 link build/resources.zip \
+            -I "$PLATFORM_JAR" \
+            --manifest AndroidManifest.xml \
+            -o build/unaligned.apk
+
+          # 3. Alinear el APK
+          ${ANDROID_BUILD_TOOLS}/zipalign -v 4 build/unaligned.apk build/overlay-signed.apk
+
+      - name: Create Git Tag and GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: Release ${{ env.TAG_NAME }}
+          body: |
+            Automated RRO build release for ${{ env.TAG_NAME }}
+            
+            - **Version Name:** ${{ env.VERSION_NAME }}
+            - **Version Code:** ${{ env.VERSION_CODE }}
+            - **Target Package:** android
+          files: build/overlay-signed.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
